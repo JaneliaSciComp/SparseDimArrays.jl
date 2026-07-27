@@ -25,6 +25,12 @@ never a scan of the full table. An index for a given dimension-subset is
 built once, lazily, on first use, and cached -- or upfront via the `indices`
 keyword for subsets known to be hot.
 
+Every index packs its keys and row lists into the *narrowest* unsigned
+integer type that fits (`UInt8`/`UInt16`/`UInt32`/`UInt64`, chosen per
+dimension from its length, and once overall for row positions from
+`length(table)`) -- this matters at the cardinalities a sparse table implies:
+a `(dim1,dim2)` index can have as many groups as there are rows.
+
     SparseDimArray(table, keycols, valuecol, dims, missingval; indices=())
 
 - `table`: any `Tables.istable` source (a `DataFrame`, `Arrow.Table`, `CSV.File`, ...)
@@ -52,6 +58,8 @@ struct SparseDimArray{T,N,D<:Tuple} <: AbstractBasicDimArray{T,N,D}
     missingval::T
     dims::D
     key2pos::NTuple{N,Union{Nothing,Dict}}   # `nothing` for a `precoded` dimension
+    postypes::NTuple{N,DataType}             # narrowest UInt type holding 1:length(dims[d])
+    rowtype::DataType                        # narrowest UInt type holding 1:nrow(table)
     indices::Dict{Tuple{Vararg{Int}},Dict}
     lock::ReentrantLock
 end
@@ -59,10 +67,17 @@ end
 DD.dims(A::SparseDimArray) = A.dims
 Base.size(A::SparseDimArray) = map(length, A.dims)
 
-# position (within dimension d's lookup) of row r's key, whether or not that
-# dimension's key column is already position-coded
+# narrowest unsigned integer type that can represent the values 1:n
+function _postype(n::Integer)
+    n <= typemax(UInt8)  ? UInt8  :
+    n <= typemax(UInt16) ? UInt16 :
+    n <= typemax(UInt32) ? UInt32 : UInt64
+end
+
+# position (within dimension d's lookup, as A.postypes[d]) of row r's key,
+# whether or not that dimension's key column is already position-coded
 @inline _pos(A::SparseDimArray, d, r) =
-    A.key2pos[d] === nothing ? Int(A.keyvecs[d][r]) : A.key2pos[d][A.keyvecs[d][r]]
+    A.key2pos[d] === nothing ? A.postypes[d](A.keyvecs[d][r]) : A.key2pos[d][A.keyvecs[d][r]]
 
 function SparseDimArray(table, keycols::NTuple{N,Symbol}, valuecol::Symbol,
                          dims::Tuple, missingval::T;
@@ -74,26 +89,33 @@ function SparseDimArray(table, keycols::NTuple{N,Symbol}, valuecol::Symbol,
     fdims = DD.format(Tuple(dims))
     keyvecs = ntuple(i -> Tables.getcolumn(cols, keycols[i]), N)
     vals = convert(Vector{T}, Tables.getcolumn(cols, valuecol))
+    postypes = ntuple(i -> _postype(length(fdims[i])), N)
+    rowtype = _postype(length(vals))
     key2pos = ntuple(N) do i
-        precoded[i] ? nothing : Dict(v => p for (p, v) in enumerate(DD.lookup(fdims[i])))
+        precoded[i] ? nothing : Dict(v => postypes[i](p) for (p, v) in enumerate(DD.lookup(fdims[i])))
     end
 
-    A = SparseDimArray{T,N,typeof(fdims)}(keyvecs, vals, missingval, fdims, key2pos,
+    A = SparseDimArray{T,N,typeof(fdims)}(keyvecs, vals, missingval, fdims, key2pos, postypes, rowtype,
                                           Dict{Tuple{Vararg{Int}},Dict}(), ReentrantLock())
     foreach(subset -> _getindex!(A, subset), indices)
     return A
 end
 
-# get-or-lazily-build-and-cache the Dict{NTuple{k,Int},Vector{Int32}} index for
-# a subset of dimension numbers, e.g. subset=(1,3) -> keyed on (dim1 pos, dim3 pos)
+# the concrete (possibly heterogeneous, per-dimension-width) key type for the
+# index over dimension-subset `subset`, e.g. subset=(1,3) -> Tuple{UInt16,UInt8}
+_keytype(A::SparseDimArray, subset::Tuple{Vararg{Int}}) = Tuple{ntuple(j -> A.postypes[subset[j]], length(subset))...}
+
+# get-or-lazily-build-and-cache the index for a subset of dimension numbers
+# (e.g. subset=(1,3) -> keyed on (dim1 pos, dim3 pos)), row lists in A.rowtype
 function _getindex!(A::SparseDimArray, subset::Tuple{Vararg{Int}})
     lock(A.lock) do
         get!(A.indices, subset) do
+            KT, RT = _keytype(A, subset), A.rowtype
             k = length(subset)
-            idx = Dict{NTuple{k,Int},Vector{Int32}}()
+            idx = Dict{KT,Vector{RT}}()
             for r in eachindex(A.values)
-                key = ntuple(j -> _pos(A, subset[j], r), k)
-                push!(get!(() -> Int32[], idx, key), Int32(r))
+                key = convert(KT, ntuple(j -> _pos(A, subset[j], r), k))
+                push!(get!(() -> RT[], idx, key), RT(r))
             end
             idx
         end
@@ -104,7 +126,7 @@ end
 function Base.getindex(A::SparseDimArray{T,N}, I::Vararg{Int,N}) where {T,N}
     subset = ntuple(identity, N)
     idx = _getindex!(A, subset)
-    rows = get(idx, I, nothing)
+    rows = get(idx, convert(_keytype(A, subset), I), nothing)
     (isnothing(rows) || isempty(rows)) ? A.missingval : A.values[first(rows)]
 end
 
@@ -129,18 +151,19 @@ function DD.rebuildsliced(f::Function, A::SparseDimArray{T,N}, I::Tuple, name=DD
     if isempty(restricted)
         # nothing restricted at all: a full materialize, one pass over every row
         for r in eachindex(A.values)
-            outidx = ntuple(d -> _pos(A, d, r), N)
+            outidx = ntuple(d -> Int(_pos(A, d, r)), N)
             out[outidx...] = A.values[r]
         end
     else
         idx = _getindex!(A, restricted)
+        KT = _keytype(A, restricted)
         selmap = ntuple(d -> full[d] ? nothing : Dict(v => i for (i, v) in enumerate(lists[d])), N)
         for combo in Iterators.product(ntuple(j -> lists[restricted[j]], length(restricted))...)
-            rows = get(idx, combo, nothing)
+            rows = get(idx, convert(KT, combo), nothing)
             isnothing(rows) && continue
             restr_out = ntuple(j -> selmap[restricted[j]][combo[j]], length(restricted))
             for r in rows
-                outidx = ntuple(d -> dimrole[d] === nothing ? _pos(A, d, r) : restr_out[dimrole[d]], N)
+                outidx = ntuple(d -> dimrole[d] === nothing ? Int(_pos(A, d, r)) : restr_out[dimrole[d]], N)
                 out[outidx...] = A.values[r]
             end
         end
