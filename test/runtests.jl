@@ -91,6 +91,29 @@ end
     @test isequal(D[2, 2, 3], A[2, 2, 3])
 end
 
+@testset "minimal-width index types" begin
+    genes    = ["g$i" for i in 1:300]     # > 255 -> needs UInt16, not UInt8
+    lineages = ["l$i" for i in 1:5]        # fits UInt8
+    times    = Int32.(1:70000)              # > 65535 -> needs UInt32
+    rows = [(gene=genes[1], lineage=lineages[1], time=times[i], val=1.0f0) for i in 1:70000]
+    tab = DataFrame(rows)
+    dims = (Gene(genes), Lineage(lineages), Time(times))
+    A = SparseDimArray(tab, (:gene, :lineage, :time), :val, dims, NaN32)
+
+    @test A.postypes == (UInt16, UInt8, UInt32)
+    @test A.rowtype == UInt32   # 70000 rows -> exceeds UInt16, needs UInt32
+
+    A[Gene=At(genes[1])]        # trigger index (1,)
+    @test keytype(A.indices[(1,)]) == Tuple{UInt16}
+    @test valtype(A.indices[(1,)]) == Vector{UInt32}
+
+    A[Lineage=At(lineages[1]), Gene=At(genes[1])]   # trigger index (1,2)
+    @test keytype(A.indices[(1, 2)]) == Tuple{UInt16,UInt8}
+
+    # values are still correct across the narrow-type boundary, not just narrow
+    @test A[1, 1, 70000] == 1.0f0
+end
+
 @testset "2-d (generality check)" begin
     Row = Dim{:Row}
     Col = Dim{:Col}
