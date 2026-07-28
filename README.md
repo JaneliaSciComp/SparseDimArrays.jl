@@ -1,7 +1,7 @@
 # SparseDimArrays.jl
 
 `SparseDimArrays.jl` wraps a long/sparse [Tables.jl](https://github.com/JuliaData/Tables.jl)
-source -- one row per non-missing cell, N key columns plus a value column --
+source -- one row per non-missing cell, N key columns plus one or more value columns --
 as a dense, N-dimensional `AbstractArray` with named-dimension indexing, via
 [DimensionalData.jl](https://github.com/rafaqz/DimensionalData.jl). Key
 combinations absent from the table read as a caller-supplied `missingval`,
@@ -10,7 +10,7 @@ memory.
 
 ## Why
 
-Given a table with several key columns and a value column, you can already do
+Given a table with several key columns and one or more value columns, you can already do
 this by hand with `DataFrames.groupby`. This package exists because:
 
 - **Fast along *any* subset of dimensions, not just one.** `A[dim1=At(x)]`,
@@ -21,14 +21,14 @@ this by hand with `DataFrames.groupby`. This package exists because:
 - **Not tied to `DataFrames.jl`.** The only dependency is `Tables.jl`, so a
   `DataFrame`, an `Arrow.Table`, a `CSV.File`, or a bare `NamedTuple` of
   vectors all work the same way, without pulling in all of DataFrames.jl.
-- **Memory-conscious at sparse-table cardinality.** At high sparsity, an
+- **Memory-conscious at sparse-table cardinality.** Even at high sparsity, an
   index over two dimensions can have nearly as many groups as the table has
-  rows. Every index packs its keys and row-position lists into the
+  rows. Here, every index packs its keys and row-position lists into the
   narrowest unsigned integer type that fits (`UInt8`/`UInt16`/`UInt32`),
   rather than machine-width `Int`.
 - **Plays directly with `DimensionalData.jl`.** `SparseDimArray` returns a
-  genuine `DimensionalData.DimArray` (backed by a small internal lazy array,
-  not a custom `DimArray`-like type) -- `At`, `Near`, keyword indexing, `set`,
+  genuine `DimensionalData.DimArray` (backed by a small internal lazy array)
+  -- `At`, `Near`, keyword indexing, `set`,
   `cat`, further slicing, all just work, and every non-scalar read returns a
   real, dense `DimArray`. Several value columns sharing the same keys (see
   `sparsedimstack` below) come back as a genuine `DimensionalData.DimStack`.
@@ -47,18 +47,19 @@ const Day    = Dim{:Day}
 
 # one row per (sensor, site, day) actually observed
 table = DataFrame(sensor=["s1","s1","s2"],
-                   site=["siteA","siteB","siteA"],
-                   day=Int16[1,1,2],
-                   reading=Float32[12.3, 0.0, 4.1])
+                  site=["siteA","siteB","siteA"],
+                  day=Int16[1,1,2],
+                  reading=Float32[12.3, 0.0, 4.1],
+                  flag=["ok", "", "hi"])       # a second value column, used later
 
 sensors = unique(table.sensor)
 sites   = unique(table.site)
 days    = sort(unique(table.day))
+dims    = (Sensor(sensors), Site(sites), Day(days))
 
-A = SparseDimArray(table, (:sensor, :site, :day), :reading,
-                   (Sensor(sensors), Site(sites), Day(days)), NaN32)
+A = SparseDimArray(table, (:sensor, :site, :day), :reading, dims, NaN32)
 
-A[Sensor=At("s1")]                       # SitexDay DimArray, NaN where absent
+A[Sensor=At("s1")]                        # SitexDay DimArray, NaN where absent
 A[Site=At("siteA"), Sensor=At("s1")]      # Day DimVector
 A[Sensor=At("s1"), Site=At("siteB"), Day=At(Int16(1))]  # scalar
 ```
@@ -72,10 +73,9 @@ mapping for it entirely:
 
 ```julia
 table2 = DataFrame(isensor=[1,1,2], isite=[1,2,1], day=Int16[1,1,2],
-                    reading=Float32[12.3, 0.0, 4.1])   # isensor/isite are 1-based
-                                                        # positions into sensors/sites
-A2 = SparseDimArray(table2, (:isensor, :isite, :day), :reading,
-                    (Sensor(sensors), Site(sites), Day(days)), NaN32;
+                   reading=Float32[12.3, 0.0, 4.1])   # isensor/isite are 1-based
+                                                      # positions into sensors/sites
+A2 = SparseDimArray(table2, (:isensor, :isite, :day), :reading, dims, NaN32;
                     precoded=(true, true, false))
 ```
 
@@ -95,8 +95,8 @@ By default, the `Dict` index for a given dimension-subset (e.g. dimensions
 access patterns will be hot:
 
 ```julia
-A = SparseDimArray(table, keycols, valuecol, dims, missingval;
-                   indices=((1,), (1,2)))
+A3 = SparseDimArray(table, (:sensor, :site, :day), :reading, dims, NaN32;
+                    indices=((1,), (1, 2)))
 ```
 
 ### Several value columns sharing the same keys
@@ -111,31 +111,36 @@ halves the memory cost of having two (or more) related columns, since the
 indices are the dominant cost, not the values themselves.
 
 ```julia
-st = sparsedimstack(table, (:sensor, :site, :day), (:reading, :flag),
-                    (Sensor(sensors), Site(sites), Day(days)), (NaN32, ""))
+A4 = sparsedimstack(table, (:sensor, :site, :day), (:reading, :flag),
+                    dims, (NaN32, ""))
 
-st.reading[Sensor=At("s1")]   # a plain DimArray, exactly like SparseDimArray's result
-st.flag[Sensor=At("s1")]      # shares the same underlying keys/indices as st.reading
+A4.reading[Sensor=At("s1")]   # a plain DimArray, exactly like SparseDimArray's result
+A4.flag[Sensor=At("s1")]      # shares the same underlying keys/indices as A4.reading
 
 # indexing the *stack* itself slices every layer together in one call
-st[Site=At("siteA"), Sensor=At("s1")]                  # -> another DimStack
-st[Site=At("siteA"), Sensor=At("s1"), Day=At(Int16(1))] # fully scalar -> NamedTuple(reading=..., flag=...)
+A4[Site=At("siteA"), Sensor=At("s1")]                   # -> another DimStack
+A4[Site=At("siteA"), Sensor=At("s1"), Day=At(Int16(1))] # fully scalar -> NamedTuple(reading=..., flag=...)
 ```
 
 ## Design notes / prior art considered
 
-`AxisKeys.jl` and `NamedDims.jl` attach names/key-vectors to an
-already-materialized dense array -- they don't provide a sparse-table-backed
-storage layer, and `AxisKeys`'s own key lookup is a linear scan by design.
-`IndexedTables.jl`'s `NDSparse` is the closest conceptual match, but it's
-sorted by one fixed key order (fast along that prefix only; multiple access
-patterns need multiple physically-resorted copies), has no
-`DimensionalData.jl` integration, and its host package (`JuliaDB.jl`) is
-explicitly unmaintained. `SparseArrayKit.jl` is a `CartesianIndex`-keyed DOK
-sparse array for tensor algebra, with no named dimensions or `Tables.jl`
-input. `DimensionalData.jl` itself has a `DimArray(table, dims)` constructor,
-but it *eagerly* densifies the table via `restore_array` -- the opposite of
-what a very sparse, multi-gigabyte table needs.
+- `AxisKeys.jl` and `NamedDims.jl` attach names/key-vectors to an
+  already-materialized dense array -- they don't provide a sparse-table-backed
+  storage layer, and `AxisKeys`'s own key lookup is a linear scan by design.
+
+- `IndexedTables.jl`'s `NDSparse` is the closest conceptual match, but it's
+  sorted by one fixed key order (fast along that prefix only; multiple access
+  patterns need multiple physically-resorted copies), has no
+  `DimensionalData.jl` integration, and its host package (`JuliaDB.jl`) is
+  explicitly unmaintained.
+
+- `SparseArrayKit.jl` is a `CartesianIndex`-keyed sparse array in DOK
+  (dictionary-of-keys: a `Dict` from index tuple to value) format, for tensor
+  algebra, with no named dimensions or `Tables.jl` input.
+
+- `DimensionalData.jl` itself has a `DimArray(table, dims)` constructor, but it
+  *eagerly* densifies the table via `restore_array` -- the opposite of what a
+  very sparse, multi-gigabyte table needs.
 
 ## License
 
