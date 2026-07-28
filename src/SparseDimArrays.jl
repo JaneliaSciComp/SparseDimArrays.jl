@@ -18,6 +18,11 @@ struct SparseDimIndex{N,D<:Tuple}
     postypes::NTuple{N,DataType}             # narrowest UInt type holding 1:length(dims[d])
     rowtype::DataType                        # narrowest UInt type holding 1:nrow(table)
     indices::Dict{Tuple{Vararg{Int}},Dict}
+    # scalar lookups fix every dimension, so each full key maps to exactly one
+    # row -- store that single row directly (Dict{fullkey=>row}) rather than a
+    # Vector per key like `indices`, which for the full key would be one
+    # 1-element Vector per row (all overhead). Lazily built; `nothing` until used.
+    scalarindex::Base.RefValue{Any}
     lock::ReentrantLock
 end
 
@@ -43,7 +48,8 @@ function _buildcore(table, keycols::NTuple{N,Symbol}, dims::Tuple,
     end
 
     SparseDimIndex{N,typeof(fdims)}(fdims, keyvecs, key2pos, postypes, rowtype,
-                                     Dict{Tuple{Vararg{Int}},Dict}(), ReentrantLock())
+                                     Dict{Tuple{Vararg{Int}},Dict}(),
+                                     Base.RefValue{Any}(nothing), ReentrantLock())
 end
 
 # position (within dimension d's lookup, as core.postypes[d]) of row r's key,
@@ -55,6 +61,22 @@ end
 # index over dimension-subset `subset`, e.g. subset=(1,3) -> Tuple{UInt16,UInt8}
 _keytype(core::SparseDimIndex, subset::Tuple{Vararg{Int}}) =
     Tuple{ntuple(j -> core.postypes[subset[j]], length(subset))...}
+
+# get-or-lazily-build-and-cache the full-key -> single-row index for scalar lookups
+function _scalarindex!(core::SparseDimIndex{N}) where N
+    lock(core.lock) do
+        if core.scalarindex[] === nothing
+            subset = ntuple(identity, N)
+            KT, RT = _keytype(core, subset), core.rowtype
+            idx = Dict{KT,RT}()
+            for r in eachindex(core.keyvecs[1])
+                idx[convert(KT, ntuple(d -> _pos(core, d, r), N))] = RT(r)
+            end
+            core.scalarindex[] = idx
+        end
+        core.scalarindex[]::Dict
+    end
+end
 
 # get-or-lazily-build-and-cache the index for a subset of dimension numbers
 # (e.g. subset=(1,3) -> keyed on (dim1 pos, dim3 pos)), row lists in core.rowtype
@@ -88,10 +110,9 @@ Base.size(A::SparseArray) = map(length, A.core.dims)
 
 # scalar fast path: exact key tuple -> O(1) hash lookup, no intermediate array
 function Base.getindex(A::SparseArray{T,N}, I::Vararg{Int,N}) where {T,N}
-    subset = ntuple(identity, N)
-    idx = _getindex!(A.core, subset)
-    rows = get(idx, convert(_keytype(A.core, subset), I), nothing)
-    (isnothing(rows) || isempty(rows)) ? A.missingval : A.values[first(rows)]
+    idx = _scalarindex!(A.core)
+    row = get(idx, convert(_keytype(A.core, ntuple(identity, N)), I), nothing)
+    isnothing(row) ? A.missingval : A.values[row]
 end
 
 _aslist(i::Integer, n) = (i,)

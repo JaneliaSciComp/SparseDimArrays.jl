@@ -157,6 +157,12 @@ end
 
     # values are still correct across the narrow-type boundary, not just narrow
     @test A[1, 1, 70000] == 1.0f0
+
+    # scalar lookups use a single-row full-key index (Dict{fullkey=>row}), not a
+    # Vector-per-key -- values are rows, not row lists
+    sidx = core.scalarindex[]
+    @test keytype(sidx) == Tuple{UInt16,UInt8,UInt32}
+    @test valtype(sidx) == UInt32   # a single row, not Vector{UInt32}
 end
 
 @testset "2-d (generality check)" begin
