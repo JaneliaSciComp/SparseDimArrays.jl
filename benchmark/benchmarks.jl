@@ -10,7 +10,7 @@
 # materialize, and the *cold* cost of building an index on first use (the part
 # the sorted-prefix work changes).
 
-using BenchmarkTools, SparseDimArrays, DimensionalData, DataFrames, Random
+using BenchmarkTools, SparseDimArrays, DimensionalData, DataFrames, Random, Printf, PrettyTables
 
 const Gene = Dim{:Gene}
 const Lineage = Dim{:Lineage}
@@ -76,6 +76,24 @@ SUITE["cold"]["gene"]   = @benchmarkable Af[Gene=At(g)] setup=(Af=mkarray(); g=r
 SUITE["cold"]["scalar"] = @benchmarkable Af[i, j, k]    setup=(
     Af=mkarray(); i=rand(1:D.ngenes); j=rand(1:D.nli); k=rand(1:D.nti))
 
+# Align a vector of "<number> <unit>" strings on the decimal point. Units may
+# differ (adaptive ns/us/ms, KiB/MiB) -- only the dots line up vertically; the
+# unit trails. Splits each into integer part / fractional part / unit, then pads
+# so the fractional parts (and thus the dots) start at the same column.
+function decimal_align(strs)
+    trip = map(strs) do s
+        parts = split(s)
+        num = parts[1]; unit = length(parts) > 1 ? parts[2] : ""
+        d = findfirst('.', num)
+        d === nothing ? (num, "", unit) : (num[1:d-1], num[d:end], unit)
+    end
+    wI = maximum(length(t[1]) for t in trip)
+    wF = maximum(length(t[2]) for t in trip)
+    # fixed-width "int.frac" prefix (dots line up), then the trailing unit;
+    # left-align these columns so the prefix -- and thus the dots -- stay aligned
+    [string(lpad(i, wI), rpad(f, wF), " ", u) for (i, f, u) in trip]
+end
+
 # resident size of the built index structures (what differs between index
 # designs), via Base.summarysize. Exercises every access pattern first so all
 # indices exist, then reports the core and its parts. Written to be agnostic to
@@ -87,17 +105,23 @@ function index_footprint()
     A[Time=At(D.times[1]), Gene=At(D.genes[1])]
     A[Time=At(D.times[1]), Lineage=At(D.lineages[1])]
     A[1, 1, 1]
-    mib(x) = string(round(Base.summarysize(x) / 2^20; digits=2), " MiB")
-    println("index footprint (after exercising every access pattern):")
-    println("  core (total)        ", mib(core))
-    hasproperty(core, :poscols) && println("  sorted poscols      ", mib(core.poscols))
+    mib(x) = Base.summarysize(x) / 2^20
+    # the core's parts, then the shared-core subtotal, the per-layer values, and
+    # the grand TOTAL (one layer's backing array = core + values)
+    items = Tuple{String,Float64}[]
+    hasproperty(core, :poscols) && push!(items, ("sorted poscols", mib(core.poscols)))
     if hasproperty(core, :scalarindex) && core.scalarindex[] !== nothing
-        println("  scalar index        ", mib(core.scalarindex[]))
+        push!(items, ("scalar index", mib(core.scalarindex[])))
     end
     for (subset, idx) in sort(collect(core.indices); by = first)
-        println("  hash index ", subset, "   ", mib(idx), "  (", length(idx), " keys)")
+        push!(items, ("hash index $(subset) ($(length(idx)) keys)", mib(idx)))
     end
-    println("  values (per layer)  ", mib(parent(A).values))
+    push!(items, ("core (shared subtotal)", mib(core)))
+    push!(items, ("values (per layer)", mib(parent(A).values)))
+    push!(items, ("TOTAL (core + values)", mib(parent(A))))
+    sizes = decimal_align([@sprintf("%.2f MiB", last(it)) for it in items])
+    pretty_table(hcat(first.(items), sizes);
+                 column_labels = ["index footprint", "size"], alignment = [:l, :l])
 end
 
 # When run as a script (not via PkgBenchmark), execute and print time, per-call
@@ -107,13 +131,15 @@ if abspath(PROGRAM_FILE) == @__FILE__
             D.nti, " times, ", round(100*nrow(D.tab)/(D.ngenes*D.nli*D.nti)), "% filled)\n")
     results = run(SUITE; verbose=true)
 
-    println("\n", rpad("benchmark", 26), rpad("time", 12), rpad("alloc", 12), "allocs")
-    for (path, trial) in sort(BenchmarkTools.leaves(results); by = pt -> join(pt[1], "/"))
-        m = median(trial)
-        println(rpad(join(path, "/"), 26),
-                rpad(BenchmarkTools.prettytime(m.time), 12),
-                rpad(BenchmarkTools.prettymemory(m.memory), 12), m.allocs)
-    end
+    lv      = sort(BenchmarkTools.leaves(results); by = pt -> join(pt[1], "/"))
+    names   = [join(p, "/") for (p, _) in lv]
+    times   = decimal_align([BenchmarkTools.prettytime(median(t).time)     for (_, t) in lv])
+    allocsz = decimal_align([BenchmarkTools.prettymemory(median(t).memory) for (_, t) in lv])
+    nallocs = [median(t).allocs for (_, t) in lv]
+    println()
+    pretty_table(hcat(names, times, allocsz, nallocs);
+                 column_labels = ["benchmark", "time", "alloc", "allocs"],
+                 alignment = [:l, :l, :l, :r])
     println()
     index_footprint()
 end
