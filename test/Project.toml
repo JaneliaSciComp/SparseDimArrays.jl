@@ -2,5 +2,4 @@
 Arrow = "69666777-d1a9-59fb-9406-91d4454c9d45"
 DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
 DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"
-SparseDimArrays = "aaf8ef49-9f55-49a6-8298-fb22be06f5e0"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
