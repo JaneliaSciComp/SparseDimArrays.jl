@@ -60,7 +60,11 @@ end
     @test hasproperty(r, :data)
     @test isequal(collect(r[Time=At(Int16(200))]), ora(:val, NaN32)[2, :, 2])
     @test typeof(set(r, Lineage=>DimensionalData.Unordered)) <: DimArray
-    @test size(cat(r, r, dims=Lineage)) == (8, 5)
+    # cat over a DISJOINT lineage set, as a caller might merge extra lineages
+    # into the result (cf. concatenating with lineages absent from this table)
+    extra = fill(NaN32, Lineage(["lE", "lF"]), Time(times))
+    combined = cat(set(r, Lineage=>DimensionalData.Unordered), extra, dims=Lineage)
+    @test size(combined) == (6, 5)
 
     # index cache: lazily built on demand, and reused (not rebuilt) on repeat access
     B = SparseDimArray(tab, (:gene, :lineage, :time), :val, dims, NaN32)
