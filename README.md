@@ -26,7 +26,7 @@ this by hand with `DataFrames.groupby`. This package exists because:
   rows. Here, every index packs its keys and row-position lists into the
   narrowest unsigned integer type that fits (`UInt8`/`UInt16`/`UInt32`),
   rather than machine-width `Int`.
-- **Plays directly with `DimensionalData.jl`.** `SparseDimArray` returns a
+- **Plays directly with `DimensionalData.jl`.** `sparsedimarray` returns a
   genuine `DimensionalData.DimArray` (backed by a small internal lazy array)
   -- `At`, `Near`, keyword indexing, `set`,
   `cat`, further slicing, all just work, and every non-scalar read returns a
@@ -57,7 +57,7 @@ sites   = unique(table.site)
 days    = sort(unique(table.day))
 dims    = (Sensor(sensors), Site(sites), Day(days))
 
-A = SparseDimArray(table, (:sensor, :site, :day), :reading, dims, NaN32)
+A = sparsedimarray(table, (:sensor, :site, :day), :reading, dims, NaN32)
 
 A[Sensor=At("s1")]                        # SitexDay DimArray, NaN where absent
 A[Site=At("siteA"), Sensor=At("s1")]      # Day DimVector
@@ -75,7 +75,7 @@ mapping for it entirely:
 table2 = DataFrame(isensor=[1,1,2], isite=[1,2,1], day=Int16[1,1,2],
                    reading=Float32[12.3, 0.0, 4.1])   # isensor/isite are 1-based
                                                       # positions into sensors/sites
-A2 = SparseDimArray(table2, (:isensor, :isite, :day), :reading, dims, NaN32;
+A2 = sparsedimarray(table2, (:isensor, :isite, :day), :reading, dims, NaN32;
                     precoded=(true, true, false))
 ```
 
@@ -95,7 +95,7 @@ By default, the `Dict` index for a given dimension-subset (e.g. dimensions
 access patterns will be hot:
 
 ```julia
-A3 = SparseDimArray(table, (:sensor, :site, :day), :reading, dims, NaN32;
+A3 = sparsedimarray(table, (:sensor, :site, :day), :reading, dims, NaN32;
                     indices=((1,), (1, 2)))
 ```
 
@@ -103,7 +103,7 @@ A3 = SparseDimArray(table, (:sensor, :site, :day), :reading, dims, NaN32;
 
 If more than one value column comes from rows with the same keys (e.g. a
 mean and a sample-count derived from the same long table), use
-`sparsedimstack` instead of calling `SparseDimArray` once per column. It
+`sparsedimstack` instead of calling `sparsedimarray` once per column. It
 builds the key->position maps and `Dict` indices *once* and shares them
 across every layer, rather than paying to load the key columns and rebuild
 every index once per value column -- at sparse-table cardinality this roughly
@@ -114,7 +114,7 @@ indices are the dominant cost, not the values themselves.
 A4 = sparsedimstack(table, (:sensor, :site, :day), (:reading, :flag),
                     dims, (NaN32, ""))
 
-A4.reading[Sensor=At("s1")]   # a plain DimArray, exactly like SparseDimArray's result
+A4.reading[Sensor=At("s1")]   # a plain DimArray, exactly like sparsedimarray's result
 A4.flag[Sensor=At("s1")]      # shares the same underlying keys/indices as A4.reading
 
 # indexing the *stack* itself slices every layer together in one call

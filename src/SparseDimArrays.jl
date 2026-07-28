@@ -4,7 +4,7 @@ using Tables
 using DimensionalData
 import DimensionalData as DD
 
-export SparseDimArray, sparsedimstack
+export sparsedimarray, sparsedimstack
 
 # ---- shared index core: everything that depends only on the key columns,
 # not on any particular value column, so multiple value columns coming from
@@ -144,7 +144,7 @@ function Base.getindex(A::SparseArray{T,N}, I::Vararg{_StdIdx,N}) where {T,N}
 end
 
 """
-    SparseDimArray(table, keycols, valuecol, dims, missingval; indices=()) -> DimArray
+    sparsedimarray(table, keycols, valuecol, dims, missingval; indices=()) -> DimArray
 
 Build a dense, N-dimensional `DimensionalData.DimArray` *view* over a
 long/sparse [Tables.jl](https://github.com/JuliaData/Tables.jl) source: one
@@ -192,7 +192,7 @@ If several value columns come from rows sharing the same keys, use
 [`sparsedimstack`](@ref) instead of calling this once per column -- it
 builds the key->position maps and `Dict` indices only once and shares them.
 """
-function SparseDimArray(table, keycols::NTuple{N,Symbol}, valuecol::Symbol,
+function sparsedimarray(table, keycols::NTuple{N,Symbol}, valuecol::Symbol,
                          dims::Tuple, missingval::T;
                          indices::Tuple = (), precoded::NTuple{N,Bool} = ntuple(_ -> false, N)) where {T,N}
     core = _buildcore(table, keycols, dims, precoded)
@@ -205,7 +205,7 @@ end
 """
     sparsedimstack(table, keycols, valuecols, dims, missingvals; indices=(), precoded=...) -> DimStack
 
-Like [`SparseDimArray`](@ref), but for several value columns that share the
+Like [`sparsedimarray`](@ref), but for several value columns that share the
 same key columns (e.g. a mean and a sample-count column derived from the same
 underlying long table). Builds the key->position maps and `Dict` indices
 *once*, and returns a `DimensionalData.DimStack` (layers named by
@@ -213,13 +213,13 @@ underlying long table). Builds the key->position maps and `Dict` indices
 columns and rebuild every index once per value column.
 
 Each layer -- `stack.\$name` -- is a plain `DimArray`, indexable exactly like
-one built by `SparseDimArray`. Indexing the *stack* itself, e.g.
+one built by `sparsedimarray`. Indexing the *stack* itself, e.g.
 `stack[dim1=At(x)]`, slices every layer together and returns another
 `DimStack` (or a `NamedTuple`, if the selector is fully scalar) -- see
 `DimensionalData.AbstractDimStack`.
 
 `valuecols::NTuple{M,Symbol}` and `missingvals::Tuple` (one per value column,
-possibly of different element types) replace `SparseDimArray`'s `valuecol`
+possibly of different element types) replace `sparsedimarray`'s `valuecol`
 and `missingval`; all other arguments are the same.
 """
 function sparsedimstack(table, keycols::NTuple{N,Symbol}, valuecols::NTuple{M,Symbol},

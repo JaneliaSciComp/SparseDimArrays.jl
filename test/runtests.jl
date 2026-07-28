@@ -35,8 +35,8 @@ end
     tab = DataFrame(rows)
 
     dims = (Gene(genes), Lineage(lineages), Time(times))
-    A  = SparseDimArray(tab, (:gene, :lineage, :time), :val, dims, NaN32)
-    As = SparseDimArray(tab, (:gene, :lineage, :time), :samp, dims, "")
+    A  = sparsedimarray(tab, (:gene, :lineage, :time), :val, dims, NaN32)
+    As = sparsedimarray(tab, (:gene, :lineage, :time), :samp, dims, "")
 
     ora = (valuecol, missingval) -> oracle(rows, valuecol, missingval, (genes, lineages, times),
                                             (:gene, :lineage, :time), nothing)
@@ -67,7 +67,7 @@ end
     @test size(combined) == (6, 5)
 
     # index cache: lazily built on demand, and reused (not rebuilt) on repeat access
-    B = SparseDimArray(tab, (:gene, :lineage, :time), :val, dims, NaN32)
+    B = sparsedimarray(tab, (:gene, :lineage, :time), :val, dims, NaN32)
     Bcore = parent(B).core
     @test isempty(Bcore.indices)
     B[Gene=At("g10")]
@@ -77,7 +77,7 @@ end
     @test Bcore.indices[(1,)] === cached   # same object: not rebuilt
 
     # eager indices built at construction match lazy ones
-    C = SparseDimArray(tab, (:gene, :lineage, :time), :val, dims, NaN32; indices=((1,), (1,2)))
+    C = sparsedimarray(tab, (:gene, :lineage, :time), :val, dims, NaN32; indices=((1,), (1,2)))
     Ccore = parent(C).core
     @test haskey(Ccore.indices, (1,))
     @test haskey(Ccore.indices, (1, 2))
@@ -90,7 +90,7 @@ end
     limap   = Dict(l => i for (i, l) in enumerate(lineages))
     codedrows = [(iGE=genemap[r.gene], iLI=limap[r.lineage], time=r.time, val=r.val) for r in rows]
     codedtab = DataFrame(codedrows)
-    D = SparseDimArray(codedtab, (:iGE, :iLI, :time), :val, dims, NaN32; precoded=(true, true, false))
+    D = sparsedimarray(codedtab, (:iGE, :iLI, :time), :val, dims, NaN32; precoded=(true, true, false))
     @test isequal(collect(D[:, :, :]), ora(:val, NaN32))
     @test isequal(collect(D[Gene=At("g10")]), collect(A[Gene=At("g10")]))
     @test isequal(collect(D[Lineage=At("lA"), Gene=At("g10")]), collect(A[Lineage=At("lA"), Gene=At("g10")]))
@@ -142,7 +142,7 @@ end
     rows = [(gene=genes[1], lineage=lineages[1], time=times[i], val=1.0f0) for i in 1:70000]
     tab = DataFrame(rows)
     dims = (Gene(genes), Lineage(lineages), Time(times))
-    A = SparseDimArray(tab, (:gene, :lineage, :time), :val, dims, NaN32)
+    A = sparsedimarray(tab, (:gene, :lineage, :time), :val, dims, NaN32)
     core = parent(A).core
 
     @test core.postypes == (UInt16, UInt8, UInt32)
@@ -170,7 +170,7 @@ end
         push!(data, (row=r, col=c, val=Float64(i*10+j)))
     end
     tab = DataFrame(data)
-    A = SparseDimArray(tab, (:row, :col), :val, (Row(rows), Col(cols)), NaN)
+    A = sparsedimarray(tab, (:row, :col), :val, (Row(rows), Col(cols)), NaN)
     ora = oracle(data, :val, NaN, (rows, cols), (:row, :col), nothing)
     @test isequal(collect(A[:, :]), ora)
     @test isequal(collect(A[Row=At("r2")]), ora[2, :])
@@ -188,7 +188,7 @@ end
         path = joinpath(dir, "t.arrow")
         Arrow.write(path, tab)
         loaded = Arrow.Table(path)
-        A = SparseDimArray(loaded, (:gene, :lineage, :time), :val,
+        A = sparsedimarray(loaded, (:gene, :lineage, :time), :val,
                             (Gene(genes), Lineage(lineages), Time(times)), NaN32)
         @test A[Gene=At("g10"), Lineage=At("lA"), Time=At(Int16(20))] isa Float32
         @test !isnan(A[Gene=At("g10"), Lineage=At("lA"), Time=At(Int16(20))])
@@ -202,7 +202,7 @@ end
     rows = [(gene=g, lineage=l, time=t, val=Float32(1))
             for (g,l,t) in Iterators.product(genes, lineages, times)][:]
     tab = DataFrame(rows)
-    A = SparseDimArray(tab, (:gene, :lineage, :time), :val,
+    A = sparsedimarray(tab, (:gene, :lineage, :time), :val,
                         (Gene(genes), Lineage(lineages), Time(times)), NaN32)
     results = Vector{Any}(undef, 20)
     Threads.@threads for i in 1:20
