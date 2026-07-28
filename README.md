@@ -14,18 +14,22 @@ Given a table with several key columns and one or more value columns, you can al
 this by hand with `DataFrames.groupby`. This package exists because:
 
 - **Fast along *any* subset of dimensions, not just one.** `A[dim1=At(x)]`,
-  `A[dim2=At(y)]`, and `A[dim1=At(x),dim2=At(y)]` are each answered by a
-  `Dict` built (once, lazily) from exactly the dimensions that call fixed --
-  never a scan of the full table, and never built for combinations that are
-  never asked for.
+  `A[dim2=At(y)]`, and `A[dim1=At(x),dim2=At(y)]` are all answered without
+  scanning the full table. Rows are sorted once (at construction) by their
+  per-dimension positions, so a query fixing a *prefix* of the dimensions
+  (`dim1`, `(dim1,dim2)`, ..., or the full key / a scalar lookup) is a binary
+  search over a contiguous block — no extra storage, cache-friendly. A query
+  fixing a *non-prefix* subset (e.g. `dim2` alone, or `(dim1,dim3)`) uses a
+  hash index built once, lazily, on first use and cached.
 - **Not tied to `DataFrames.jl`.** The only dependency is `Tables.jl`, so a
   `DataFrame`, an `Arrow.Table`, a `CSV.File`, or a bare `NamedTuple` of
   vectors all work the same way, without pulling in all of DataFrames.jl.
 - **Memory-conscious at sparse-table cardinality.** Even at high sparsity, an
   index over two dimensions can have nearly as many groups as the table has
-  rows. Here, every index packs its keys and row-position lists into the
-  narrowest unsigned integer type that fits (`UInt8`/`UInt16`/`UInt32`),
-  rather than machine-width `Int`.
+  rows. The prefix chain costs no index memory (it rides the sort order); the
+  hash indices that non-prefix subsets need pack their keys and row-position
+  lists into the narrowest unsigned integer type that fits
+  (`UInt8`/`UInt16`/`UInt32`), rather than machine-width `Int`.
 - **Plays directly with `DimensionalData.jl`.** `sparsedimarray` returns a
   genuine `DimensionalData.DimArray` (backed by a small internal lazy array)
   -- `At`, `Near`, keyword indexing, `set`,

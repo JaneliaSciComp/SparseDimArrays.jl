@@ -66,23 +66,27 @@ end
     combined = cat(set(r, Lineage=>DimensionalData.Unordered), extra, dims=Lineage)
     @test size(combined) == (6, 5)
 
-    # index cache: lazily built on demand, and reused (not rebuilt) on repeat access
+    # hash index for a NON-prefix subset: lazily built on demand, reused on repeat.
+    # (prefix subsets like (1,) or (1,2) are served by the sort order, no Dict.)
     B = sparsedimarray(tab, (:gene, :lineage, :time), :val, dims, NaN32)
     Bcore = parent(B).core
     @test isempty(Bcore.indices)
-    B[Gene=At("g10")]
-    @test haskey(Bcore.indices, (1,))
-    cached = Bcore.indices[(1,)]
-    B[Gene=At("g10")]
-    @test Bcore.indices[(1,)] === cached   # same object: not rebuilt
+    B[Gene=At("g10")]                       # (1,) is a prefix -> no hash index
+    @test isempty(Bcore.indices)
+    B[Lineage=At("lA")]                     # (2,) is non-prefix -> builds a hash index
+    @test haskey(Bcore.indices, (2,))
+    cached = Bcore.indices[(2,)]
+    B[Lineage=At("lA")]
+    @test Bcore.indices[(2,)] === cached    # same object: not rebuilt
 
-    # eager indices built at construction match lazy ones
-    C = sparsedimarray(tab, (:gene, :lineage, :time), :val, dims, NaN32; indices=((1,), (1,2)))
+    # eager `indices` builds non-prefix subsets; prefix ones are ignored (free via sort)
+    C = sparsedimarray(tab, (:gene, :lineage, :time), :val, dims, NaN32; indices=((2,), (2,3), (1,)))
     Ccore = parent(C).core
-    @test haskey(Ccore.indices, (1,))
-    @test haskey(Ccore.indices, (1, 2))
-    @test isequal(collect(C[Gene=At("g10")]), collect(A[Gene=At("g10")]))
-    @test isequal(collect(C[Lineage=At("lA"), Gene=At("g10")]), collect(A[Lineage=At("lA"), Gene=At("g10")]))
+    @test haskey(Ccore.indices, (2,))
+    @test haskey(Ccore.indices, (2, 3))
+    @test !haskey(Ccore.indices, (1,))      # prefix -> not built
+    @test isequal(collect(C[Lineage=At("lA")]), collect(A[Lineage=At("lA")]))
+    @test isequal(collect(C[Lineage=At("lA"), Time=At(Int16(300))]), collect(A[Lineage=At("lA"), Time=At(Int16(300))]))
 
     # precoded columns: gene/lineage stored as compact 1-based integer codes
     # (matching dimension position directly) instead of repeating name strings
@@ -148,21 +152,22 @@ end
     @test core.postypes == (UInt16, UInt8, UInt32)
     @test core.rowtype == UInt32   # 70000 rows -> exceeds UInt16, needs UInt32
 
-    A[Gene=At(genes[1])]        # trigger index (1,)
-    @test keytype(core.indices[(1,)]) == Tuple{UInt16}
-    @test valtype(core.indices[(1,)]) == Vector{UInt32}
+    # the sorted position columns use the narrow per-dimension types
+    @test eltype.(core.poscols) == (UInt16, UInt8, UInt32)
 
-    A[Lineage=At(lineages[1]), Gene=At(genes[1])]   # trigger index (1,2)
-    @test keytype(core.indices[(1, 2)]) == Tuple{UInt16,UInt8}
+    # a non-prefix subset's hash index packs keys/rows into the narrow types
+    A[Time=At(times[end]), Lineage=At(lineages[1])]   # (2,3) non-prefix -> hash index
+    @test keytype(core.indices[(2, 3)]) == Tuple{UInt8,UInt32}
+    @test valtype(core.indices[(2, 3)]) == Vector{UInt32}
+
+    # prefix subsets are served by the sort order, so build no hash index
+    A[Gene=At(genes[1])]                         # (1,) prefix
+    A[Lineage=At(lineages[1]), Gene=At(genes[1])] # (1,2) prefix
+    @test !haskey(core.indices, (1,))
+    @test !haskey(core.indices, (1, 2))
 
     # values are still correct across the narrow-type boundary, not just narrow
     @test A[1, 1, 70000] == 1.0f0
-
-    # scalar lookups use a single-row full-key index (Dict{fullkey=>row}), not a
-    # Vector-per-key -- values are rows, not row lists
-    sidx = core.scalarindex[]
-    @test keytype(sidx) == Tuple{UInt16,UInt8,UInt32}
-    @test valtype(sidx) == UInt32   # a single row, not Vector{UInt32}
 end
 
 @testset "2-d (generality check)" begin
