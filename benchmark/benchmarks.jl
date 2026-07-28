@@ -76,12 +76,44 @@ SUITE["cold"]["gene"]   = @benchmarkable Af[Gene=At(g)] setup=(Af=mkarray(); g=r
 SUITE["cold"]["scalar"] = @benchmarkable Af[i, j, k]    setup=(
     Af=mkarray(); i=rand(1:D.ngenes); j=rand(1:D.nli); k=rand(1:D.nti))
 
-# When run as a script (not via PkgBenchmark), execute and print results.
+# resident size of the built index structures (what differs between index
+# designs), via Base.summarysize. Exercises every access pattern first so all
+# indices exist, then reports the core and its parts. Written to be agnostic to
+# the core's fields so it works across index designs.
+function index_footprint()
+    core = parent(A).core
+    A[Gene=At(D.genes[1])]; A[Lineage=At(D.lineages[1])]; A[Time=At(D.times[1])]
+    A[Lineage=At(D.lineages[1]), Gene=At(D.genes[1])]
+    A[Time=At(D.times[1]), Gene=At(D.genes[1])]
+    A[Time=At(D.times[1]), Lineage=At(D.lineages[1])]
+    A[1, 1, 1]
+    mib(x) = string(round(Base.summarysize(x) / 2^20; digits=2), " MiB")
+    println("index footprint (after exercising every access pattern):")
+    println("  core (total)        ", mib(core))
+    hasproperty(core, :poscols) && println("  sorted poscols      ", mib(core.poscols))
+    if hasproperty(core, :scalarindex) && core.scalarindex[] !== nothing
+        println("  scalar index        ", mib(core.scalarindex[]))
+    end
+    for (subset, idx) in sort(collect(core.indices); by = first)
+        println("  hash index ", subset, "   ", mib(idx), "  (", length(idx), " keys)")
+    end
+    println("  values (per layer)  ", mib(parent(A).values))
+end
+
+# When run as a script (not via PkgBenchmark), execute and print time, per-call
+# allocations, and the index footprint.
 if abspath(PROGRAM_FILE) == @__FILE__
     println("rows: ", nrow(D.tab), "  (", D.ngenes, " genes x ", D.nli, " lineages x ",
             D.nti, " times, ", round(100*nrow(D.tab)/(D.ngenes*D.nli*D.nti)), "% filled)\n")
     results = run(SUITE; verbose=true)
+
+    println("\n", rpad("benchmark", 26), rpad("time", 12), rpad("alloc", 12), "allocs")
+    for (path, trial) in sort(BenchmarkTools.leaves(results); by = pt -> join(pt[1], "/"))
+        m = median(trial)
+        println(rpad(join(path, "/"), 26),
+                rpad(BenchmarkTools.prettytime(m.time), 12),
+                rpad(BenchmarkTools.prettymemory(m.memory), 12), m.allocs)
+    end
     println()
-    show(stdout, MIME"text/plain"(), results)
-    println()
+    index_footprint()
 end
