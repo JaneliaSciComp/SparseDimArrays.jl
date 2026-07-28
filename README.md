@@ -26,10 +26,12 @@ this by hand with `DataFrames.groupby`. This package exists because:
   rows. Every index packs its keys and row-position lists into the
   narrowest unsigned integer type that fits (`UInt8`/`UInt16`/`UInt32`),
   rather than machine-width `Int`.
-- **Plays directly with `DimensionalData.jl`.** Once constructed, a
-  `SparseDimArray` *is* a `DimensionalData.AbstractBasicDimArray` -- `At`,
-  `Near`, keyword indexing, `set`, `cat`, further slicing, all just work,
-  and every non-scalar read returns a real, dense `DimArray`.
+- **Plays directly with `DimensionalData.jl`.** `SparseDimArray` returns a
+  genuine `DimensionalData.DimArray` (backed by a small internal lazy array,
+  not a custom `DimArray`-like type) -- `At`, `Near`, keyword indexing, `set`,
+  `cat`, further slicing, all just work, and every non-scalar read returns a
+  real, dense `DimArray`. Several value columns sharing the same keys (see
+  `sparsedimstack` below) come back as a genuine `DimensionalData.DimStack`.
 
 We didn't find an existing package that does this; see the design notes
 below for what was considered and why.
@@ -95,6 +97,29 @@ access patterns will be hot:
 ```julia
 A = SparseDimArray(table, keycols, valuecol, dims, missingval;
                    indices=((1,), (1,2)))
+```
+
+### Several value columns sharing the same keys
+
+If more than one value column comes from rows with the same keys (e.g. a
+mean and a sample-count derived from the same long table), use
+`sparsedimstack` instead of calling `SparseDimArray` once per column. It
+builds the key->position maps and `Dict` indices *once* and shares them
+across every layer, rather than paying to load the key columns and rebuild
+every index once per value column -- at sparse-table cardinality this roughly
+halves the memory cost of having two (or more) related columns, since the
+indices are the dominant cost, not the values themselves.
+
+```julia
+st = sparsedimstack(table, (:sensor, :site, :day), (:reading, :flag),
+                    (Sensor(sensors), Site(sites), Day(days)), (NaN32, ""))
+
+st.reading[Sensor=At("s1")]   # a plain DimArray, exactly like SparseDimArray's result
+st.flag[Sensor=At("s1")]      # shares the same underlying keys/indices as st.reading
+
+# indexing the *stack* itself slices every layer together in one call
+st[Site=At("siteA"), Sensor=At("s1")]                  # -> another DimStack
+st[Site=At("siteA"), Sensor=At("s1"), Day=At(Int16(1))] # fully scalar -> NamedTuple(reading=..., flag=...)
 ```
 
 ## Design notes / prior art considered
