@@ -32,15 +32,27 @@ _postype(n::Integer) = n <= typemax(UInt8)  ? UInt8  :
                        n <= typemax(UInt16) ? UInt16 :
                        n <= typemax(UInt32) ? UInt32 : UInt64
 
+# Object to read individual columns from with `Tables.getcolumn`, WITHOUT
+# forcing every column of `table` to materialize. The Tables.jl contract only
+# defines `getcolumn` on the object returned by `Tables.columns`, but some lazy
+# columnar sources (e.g. Parquet2's `Dataset`) eagerly decode *every* column in
+# their `Tables.columns` despite advertising `columnaccess`. Column-access
+# tables define `getcolumn` directly on themselves (DataFrames, Arrow, CSV,
+# Parquet2, NamedTuple column tables, ...), so use the table itself and only
+# materialize genuinely row-oriented sources -- which have no per-column
+# access to preserve anyway.
+_colsource(table) = Tables.columnaccess(table) ? table : Tables.columns(table)
+
 # Build the core and return it together with the sort permutation (original ->
 # sorted row order), which the caller applies to each value column so values line
-# up with the sorted `poscols`.
+# up with the sorted `poscols` -- or `nothing` when the table's rows are already
+# in sorted order, in which case the caller must skip the permutation.
 function _buildcore(table, keycols::NTuple{N,Symbol}, dims::Tuple,
                      precoded::NTuple{N,Bool}) where N
     Tables.istable(table) || throw(ArgumentError("`table` must be a Tables.jl-compatible source"))
     length(dims) == N || throw(ArgumentError("length(dims) ($(length(dims))) must equal length(keycols) ($N)"))
 
-    cols = Tables.columns(table)
+    cols = _colsource(table)
     fdims = DD.format(Tuple(dims))
     keyvecs = ntuple(i -> Tables.getcolumn(cols, keycols[i]), N)
     postypes = ntuple(i -> _postype(length(fdims[i])), N)
@@ -55,15 +67,34 @@ function _buildcore(table, keycols::NTuple{N,Symbol}, dims::Tuple,
         P, kv, k2p = postypes[d], keyvecs[d], key2pos[d]
         P[k2p === nothing ? P(kv[r]) : k2p[kv[r]] for r in 1:nrows]
     end
-    # ... then sort rows lexicographically by (pos[1], ..., pos[N])
-    keytuples = [ntuple(d -> pos[d][r], N) for r in 1:nrows]
-    perm = convert(Vector{rowtype}, sortperm(keytuples))
-    poscols = ntuple(d -> pos[d][perm], N)
+    # ... then sort rows lexicographically by (pos[1], ..., pos[N]). Sortedness
+    # is by dimension POSITION, not raw key value -- the two coincide only when
+    # each dim's lookup is itself in the keys' sort order -- so detect it from
+    # `pos` directly (allocation-free) rather than trusting a caller flag, and
+    # skip the sort and every downstream permutation copy when it already holds.
+    if issorted(ntuple(d -> pos[d][r], N) for r in 1:nrows)
+        perm = nothing
+        poscols = pos
+    else
+        keytuples = [ntuple(d -> pos[d][r], N) for r in 1:nrows]
+        perm = convert(Vector{rowtype}, sortperm(keytuples))
+        poscols = ntuple(d -> pos[d][perm], N)
+    end
 
     core = SparseDimIndex{N,typeof(fdims)}(fdims, poscols, postypes, rowtype,
                                             Dict{Tuple{Vararg{Int}},Dict}(), ReentrantLock())
     return core, perm
 end
+
+# Reorder a value column into the core's sorted row order. When the table was
+# already sorted (`perm === nothing`) no copy is made at all -- `convert` is a
+# no-op for a `Vector{T}` input -- so the result may ALIAS the table's own
+# column. That sharing is deliberate: this package never mutates values, and it
+# saves a full copy per value column. The flip side is that a caller who
+# mutates the source table's column in place afterwards will see the array
+# change with it.
+_sortvals(::Type{T}, col, perm::Vector) where T = convert(Vector{T}, col)[perm]
+_sortvals(::Type{T}, col, ::Nothing) where T = convert(Vector{T}, col)
 
 # the concrete (possibly heterogeneous, per-dimension-width) key type for the
 # index over dimension-subset `subset`, e.g. subset=(1,3) -> Tuple{UInt16,UInt8}
@@ -200,6 +231,15 @@ Every hash index packs its keys and row lists into the *narrowest* unsigned
 integer type that fits (`UInt8`/`UInt16`/`UInt32`/`UInt64`, per dimension from
 its length, and once overall for row positions from `length(table)`).
 
+Only the key columns and the requested value column(s) are ever read from
+`table`, so lazy columnar sources (e.g. a Parquet2 `Dataset`) never decode
+unrelated columns. And if the table's rows already arrive sorted -- by
+dimension *position*, which matches key-value order whenever each dimension's
+lookup is itself sorted -- the sort is detected as unnecessary and skipped,
+along with every permutation copy; the resulting array's value vector may then
+share memory with the table's own column (nothing here ever mutates it, but an
+in-place edit to the source column would show through).
+
 - `table`: any `Tables.istable` source (a `DataFrame`, `Arrow.Table`, `CSV.File`, ...)
 - `keycols::NTuple{N,Symbol}`: column name holding the key for each dimension,
   in the same order as `dims`. Values need not be sorted, unique-per-row, or
@@ -224,7 +264,7 @@ function sparsedimarray(table, keycols::NTuple{N,Symbol}, valuecol::Symbol,
                          indices::Tuple = (), precoded::NTuple{N,Bool} = ntuple(_ -> false, N)) where {T,N}
     core, perm = _buildcore(table, keycols, dims, precoded)
     foreach(subset -> _isprefix(subset) || _getindex!(core, subset), indices)
-    vals = convert(Vector{T}, Tables.getcolumn(Tables.columns(table), valuecol))[perm]
+    vals = _sortvals(T, Tables.getcolumn(_colsource(table), valuecol), perm)
     arr = SparseArray{T,N,typeof(core)}(core, vals, missingval)
     DimArray(arr, core.dims)
 end
@@ -255,10 +295,10 @@ function sparsedimstack(table, keycols::NTuple{N,Symbol}, valuecols::NTuple{M,Sy
     core, perm = _buildcore(table, keycols, dims, precoded)
     foreach(subset -> _isprefix(subset) || _getindex!(core, subset), indices)
 
-    cols = Tables.columns(table)
+    cols = _colsource(table)
     arrays = ntuple(M) do i
         T = typeof(missingvals[i])
-        vals = convert(Vector{T}, Tables.getcolumn(cols, valuecols[i]))[perm]
+        vals = _sortvals(T, Tables.getcolumn(cols, valuecols[i]), perm)
         SparseArray{T,N,typeof(core)}(core, vals, missingvals[i])
     end
     DimStack(NamedTuple{valuecols}(arrays), core.dims)

@@ -188,6 +188,36 @@ end
     @test isequal(A[2,3], ora[2,3])
 end
 
+@testset "already-sorted fast path: no permutation, values alias the column" begin
+    genes    = ["g11", "g10", "g12"]   # sortedness is by POSITION in this lookup order
+    lineages = ["lB", "lA", "lC"]
+    times    = Int16[10, 20, 30]
+    rows = NamedTuple[]
+    for (ig, g) in enumerate(genes), (il, l) in enumerate(lineages), (it, t) in enumerate(times)
+        (ig + il + it) % 3 == 0 && continue
+        push!(rows, (gene=g, lineage=l, time=t, val=Float32(ig*100+il*10+it)))
+    end
+    dims = (Gene(genes), Lineage(lineages), Time(times))
+    ora = oracle(rows, :val, NaN32, (genes, lineages, times), (:gene, :lineage, :time), nothing)
+
+    # loop order above == position-lexicographic order: the sort is skipped and
+    # the value vector is the DataFrame's own column, not a permuted copy
+    sortedtab = DataFrame(rows)
+    A = sparsedimarray(sortedtab, (:gene, :lineage, :time), :val, dims, NaN32)
+    @test parent(A).values === sortedtab.val
+    @test isequal(collect(A[:, :, :]), ora)
+    @test isequal(collect(A[Gene=At("g10")]), ora[2, :, :])
+
+    # reversed rows (strictly descending, since keys are unique): must sort,
+    # so values are a fresh permuted copy -- with identical results
+    shuffledtab = DataFrame(reverse(rows))
+    B = sparsedimarray(shuffledtab, (:gene, :lineage, :time), :val, dims, NaN32)
+    @test parent(B).values !== shuffledtab.val
+    @test isequal(collect(B[:, :, :]), ora)
+    @test isequal(collect(A[:, :, :]), collect(B[:, :, :]))
+    @test parent(B).core.poscols == parent(A).core.poscols
+end
+
 @testset "Arrow round-trip" begin
     genes = ["g11", "g10", "g12"]
     lineages = ["lB", "lA", "lC"]
