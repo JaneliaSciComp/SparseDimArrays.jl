@@ -43,6 +43,30 @@ _postype(n::Integer) = n <= typemax(UInt8)  ? UInt8  :
 # access to preserve anyway.
 _colsource(table) = Tables.columnaccess(table) ? table : Tables.columns(table)
 
+# Function barriers for the per-row construction loops. The narrow position
+# types are picked at runtime (`postypes`/`rowtype` are `DataType`s, as the
+# struct stores them), so loops touching them directly are type-unstable and
+# pay a boxing dynamic dispatch on EVERY row; routing through these barriers
+# specializes each loop on the concrete types instead -- one dynamic call per
+# dimension, not one per row.
+_key2pos(::Type{P}, lookup) where P = Dict(v => P(p) for (p, v) in enumerate(lookup))
+_poscol(::Type{P}, kv, ::Nothing) where P = P[P(v) for v in kv]
+_poscol(::Type{P}, kv, k2p::Dict) where P = P[k2p[v] for v in kv]
+
+# Sortedness check + sort + permute (also behind the barrier). Sortedness is by
+# dimension POSITION, not raw key value -- the two coincide only when each
+# dim's lookup is itself in the keys' sort order -- so detect it from `pos`
+# directly (allocation-free) rather than trusting a caller flag, and skip the
+# sort and every downstream permutation copy (`perm === nothing`) when it
+# already holds.
+function _sortpos(pos::NTuple{N,AbstractVector}, ::Type{R}) where {N,R}
+    nrows = length(pos[1])
+    issorted(ntuple(d -> pos[d][r], N) for r in 1:nrows) && return nothing, pos
+    keytuples = [ntuple(d -> pos[d][r], N) for r in 1:nrows]
+    perm = convert(Vector{R}, sortperm(keytuples))
+    return perm, ntuple(d -> pos[d][perm], N)
+end
+
 # Build the core and return it together with the sort permutation (original ->
 # sorted row order), which the caller applies to each value column so values line
 # up with the sorted `poscols` -- or `nothing` when the table's rows are already
@@ -59,27 +83,13 @@ function _buildcore(table, keycols::NTuple{N,Symbol}, dims::Tuple,
     nrows = length(keyvecs[1])
     rowtype = _postype(nrows)
     key2pos = ntuple(N) do i
-        precoded[i] ? nothing : Dict(v => postypes[i](p) for (p, v) in enumerate(DD.lookup(fdims[i])))
+        precoded[i] ? nothing : _key2pos(postypes[i], DD.lookup(fdims[i]))
     end
 
-    # position of every row in every dimension (unsorted) ...
-    pos = ntuple(N) do d
-        P, kv, k2p = postypes[d], keyvecs[d], key2pos[d]
-        P[k2p === nothing ? P(kv[r]) : k2p[kv[r]] for r in 1:nrows]
-    end
-    # ... then sort rows lexicographically by (pos[1], ..., pos[N]). Sortedness
-    # is by dimension POSITION, not raw key value -- the two coincide only when
-    # each dim's lookup is itself in the keys' sort order -- so detect it from
-    # `pos` directly (allocation-free) rather than trusting a caller flag, and
-    # skip the sort and every downstream permutation copy when it already holds.
-    if issorted(ntuple(d -> pos[d][r], N) for r in 1:nrows)
-        perm = nothing
-        poscols = pos
-    else
-        keytuples = [ntuple(d -> pos[d][r], N) for r in 1:nrows]
-        perm = convert(Vector{rowtype}, sortperm(keytuples))
-        poscols = ntuple(d -> pos[d][perm], N)
-    end
+    # position of every row in every dimension (unsorted), then sort rows
+    # lexicographically by (pos[1], ..., pos[N]) -- unless they already are
+    pos = ntuple(d -> _poscol(postypes[d], keyvecs[d], key2pos[d]), N)
+    perm, poscols = _sortpos(pos, rowtype)
 
     core = SparseDimIndex{N,typeof(fdims)}(fdims, poscols, postypes, rowtype,
                                             Dict{Tuple{Vararg{Int}},Dict}(), ReentrantLock())

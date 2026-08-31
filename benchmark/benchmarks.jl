@@ -5,12 +5,14 @@
 # or with PkgBenchmark (uses the `SUITE` defined here):
 #     using PkgBenchmark; benchmarkpkg("SparseDimArrays")
 #
-# The suite covers construction and every access pattern the design cares about:
+# The suite covers construction -- {shuffled, presorted} rows crossed with
+# {in-memory DataFrame, lazy Parquet2 Dataset} sources -- and every access
+# pattern the design cares about:
 # the scalar (full-key) lookup, single-dimension slices, a pair slice, a full
 # materialize, and the *cold* cost of building an index on first use (the part
 # the sorted-prefix work changes).
 
-using BenchmarkTools, SparseDimArrays, DimensionalData, DataFrames, Random, Printf, PrettyTables
+using BenchmarkTools, SparseDimArrays, DimensionalData, DataFrames, Parquet2, Random, Printf, PrettyTables
 
 const Gene = Dim{:Gene}
 const Lineage = Dim{:Lineage}
@@ -42,14 +44,39 @@ end
 
 const D = make_table()
 const dims = (Gene(D.genes), Lineage(D.lineages), Time(D.times))
-mkarray() = sparsedimarray(D.tab, (:iGE, :iLI, :TI), :val, dims, NaN32;
-                           precoded=(true, true, false))
+
+# the same rows presorted by position: construction detects this and skips the
+# sort and every permutation copy (values then alias the table's column)
+const sortedtab = sort(D.tab, [:iGE, :iLI, :TI])
+
+# The same tables as lazy Parquet2 `Dataset`s, padded with `npad` value columns
+# that are never asked for: construction reads columns selectively, so the
+# padding must never decode. (An in-memory DataFrame hands back its columns for
+# free either way -- lazy sources are where selective reads matter.)
+function parquet_dataset(tab; npad=4)
+    path = joinpath(mktempdir(), "bench.parquet")
+    padded = copy(tab)
+    rng = MersenneTwister(0)
+    for i in 1:npad
+        padded[!, "pad$i"] = rand(rng, Float32, nrow(tab))
+    end
+    Parquet2.writefile(path, padded)
+    Parquet2.Dataset(path)
+end
+const pq       = parquet_dataset(D.tab)
+const pqsorted = parquet_dataset(sortedtab)
+
+mkarray(tab=D.tab) = sparsedimarray(tab, (:iGE, :iLI, :TI), :val, dims, NaN32;
+                                    precoded=(true, true, false))
 
 const SUITE = BenchmarkGroup()
 
-# --- construction ---
+# --- construction: {shuffled, presorted} x {in-memory DataFrame, lazy Parquet2} ---
 SUITE["construct"] = BenchmarkGroup()
-SUITE["construct"]["array"] = @benchmarkable mkarray()
+SUITE["construct"]["array"]             = @benchmarkable mkarray()
+SUITE["construct"]["array-presorted"]   = @benchmarkable mkarray(sortedtab)
+SUITE["construct"]["parquet"]           = @benchmarkable mkarray(pq)
+SUITE["construct"]["parquet-presorted"] = @benchmarkable mkarray(pqsorted)
 SUITE["construct"]["stack"] = @benchmarkable sparsedimstack(D.tab, (:iGE, :iLI, :TI),
     (:val,), dims, (NaN32,); precoded=(true, true, false))
 
