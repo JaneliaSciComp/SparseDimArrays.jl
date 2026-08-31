@@ -1,7 +1,7 @@
 name = "SparseDimArrays"
 uuid = "aaf8ef49-9f55-49a6-8298-fb22be06f5e0"
 authors = ["Ben Arthur <arthurb@hhmi.org>"]
-version = "0.1.0"
+version = "0.2.0"
 
 [deps]
 DimensionalData = "0703355e-b756-11e9-17c0-8b28908087d0"

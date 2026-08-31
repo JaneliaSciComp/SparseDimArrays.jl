@@ -149,16 +149,21 @@ end
     A = sparsedimarray(tab, (:gene, :lineage, :time), :val, dims, NaN32)
     core = parent(A).core
 
-    @test core.postypes == (UInt16, UInt8, UInt32)
-    @test core.rowtype == UInt32   # 70000 rows -> exceeds UInt16, needs UInt32
+    @test SparseDimArrays._postypes(core) == (UInt16, UInt8, UInt32)
+    @test SparseDimArrays._rowtype(core) == UInt32   # 70000 rows -> exceeds UInt16, needs UInt32
 
     # the sorted position columns use the narrow per-dimension types
     @test eltype.(core.poscols) == (UInt16, UInt8, UInt32)
 
-    # a non-prefix subset's hash index packs keys/rows into the narrow types
-    A[Time=At(times[end]), Lineage=At(lineages[1])]   # (2,3) non-prefix -> hash index
-    @test keytype(core.indices[(2, 3)]) == Tuple{UInt8,UInt32}
-    @test valtype(core.indices[(2, 3)]) == Vector{UInt32}
+    # a non-prefix subset's group index packs keys/rows into the narrow types
+    A[Time=At(times[end]), Lineage=At(lineages[1])]   # (2,3) non-prefix -> group index
+    idx23 = core.indices[(2, 3)]
+    @test idx23 isa SparseDimArrays.GroupIndex
+    @test keytype(idx23.ranges) == Tuple{UInt8,UInt32}
+    @test eltype(idx23.rows) == UInt32
+    # every row id appears exactly once, carved into exact-length groups
+    @test length(idx23.rows) == 70000
+    @test sum(length, values(idx23.ranges)) == 70000
 
     # prefix subsets are served by the sort order, so build no hash index
     A[Gene=At(genes[1])]                         # (1,) prefix
@@ -216,6 +221,18 @@ end
     @test isequal(collect(B[:, :, :]), ora)
     @test isequal(collect(A[:, :, :]), collect(B[:, :, :]))
     @test parent(B).core.poscols == parent(A).core.poscols
+
+    # precoded key columns already stored at the narrow position width are
+    # reused as-is -- presorted + precoded construction copies nothing at all
+    coded = DataFrame(g=UInt8[], l=UInt8[], t=UInt8[], val=Float32[])
+    for (ig, g) in enumerate(genes), (il, l) in enumerate(lineages), (it, t) in enumerate(times)
+        (ig + il + it) % 3 == 0 && continue
+        push!(coded, (g=UInt8(ig), l=UInt8(il), t=UInt8(it), val=Float32(ig*100+il*10+it)))
+    end
+    E = sparsedimarray(coded, (:g, :l, :t), :val, dims, NaN32; precoded=(true, true, true))
+    @test parent(E).core.poscols[1] === coded.g
+    @test parent(E).values === coded.val
+    @test isequal(collect(E[:, :, :]), ora)
 end
 
 @testset "Arrow round-trip" begin

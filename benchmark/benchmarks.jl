@@ -141,7 +141,7 @@ function index_footprint()
         push!(items, ("scalar index", mib(core.scalarindex[])))
     end
     for (subset, idx) in sort(collect(core.indices); by = first)
-        push!(items, ("hash index $(subset) ($(length(idx)) keys)", mib(idx)))
+        push!(items, ("index $(subset) ($(length(idx)) keys)", mib(idx)))
     end
     push!(items, ("core (shared subtotal)", mib(core)))
     push!(items, ("values (per layer)", mib(parent(A).values)))

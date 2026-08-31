@@ -13,19 +13,24 @@ export sparsedimarray, sparsedimstack
 # each answered by binary search (`searchsorted`) over a contiguous block, with
 # cache-contiguous values. Non-prefix subsets (e.g. just dim2, or (dim1,dim3))
 # aren't contiguous in that order, so they fall back to a lazily-built, cached
-# hash `Dict`. Everything here depends only on the key columns, not on any value
-# column, so several value columns sharing the same keys share one core via
-# `sparsedimstack`.
-struct SparseDimIndex{N,D<:Tuple}
+# [`GroupIndex`](@ref). Everything here depends only on the key columns, not on
+# any value column, so several value columns sharing the same keys share one
+# core via `sparsedimstack`.
+struct SparseDimIndex{N,D<:Tuple,PC<:NTuple{N,Vector},R<:Unsigned}
     dims::D
     # per-row positions, PHYSICALLY SORTED lexicographically by (dim1,...,dimN);
-    # both the row->position map and the sorted-prefix index.
-    poscols::NTuple{N,Vector}
-    postypes::NTuple{N,DataType}   # narrowest UInt type holding 1:length(dims[d])
-    rowtype::DataType              # narrowest UInt type holding 1:nrow(table)
-    indices::Dict{Tuple{Vararg{Int}},Dict}   # lazy hash indices for non-prefix subsets
+    # both the row->position map and the sorted-prefix index. Concretely typed
+    # in PC (per dimension, the narrowest UInt holding 1:length(dims[d])) so
+    # the per-row query loops specialize instead of boxing on every access.
+    poscols::PC
+    indices::Dict{Tuple{Vararg{Int}},Any}   # lazy GroupIndex per non-prefix subset
     lock::ReentrantLock
 end
+
+# derived, not stored: the narrow per-dimension position types live in PC's
+# element types, and the narrow row-id type (holding 1:nrow(table)) in R
+_postypes(core::SparseDimIndex) = map(eltype, core.poscols)
+_rowtype(::SparseDimIndex{N,D,PC,R}) where {N,D,PC,R} = R
 
 # narrowest unsigned integer type that can represent the values 1:n
 _postype(n::Integer) = n <= typemax(UInt8)  ? UInt8  :
@@ -50,6 +55,11 @@ _colsource(table) = Tables.columnaccess(table) ? table : Tables.columns(table)
 # specializes each loop on the concrete types instead -- one dynamic call per
 # dimension, not one per row.
 _key2pos(::Type{P}, lookup) where P = Dict(v => P(p) for (p, v) in enumerate(lookup))
+# A precoded key column already stored at the narrow position width is reused
+# as-is, not copied -- when the rows turn out presorted the core's poscols then
+# alias the table's own column (the unsorted path copies via `pos[d][perm]`
+# regardless). Same deliberate read-only sharing as `_sortvals` on values.
+_poscol(::Type{P}, kv::Vector{P}, ::Nothing) where P = kv
 _poscol(::Type{P}, kv, ::Nothing) where P = P[P(v) for v in kv]
 _poscol(::Type{P}, kv, k2p::Dict) where P = P[k2p[v] for v in kv]
 
@@ -91,25 +101,72 @@ function _buildcore(table, keycols::NTuple{N,Symbol}, dims::Tuple,
     pos = ntuple(d -> _poscol(postypes[d], keyvecs[d], key2pos[d]), N)
     perm, poscols = _sortpos(pos, rowtype)
 
-    core = SparseDimIndex{N,typeof(fdims)}(fdims, poscols, postypes, rowtype,
-                                            Dict{Tuple{Vararg{Int}},Dict}(), ReentrantLock())
+    core = SparseDimIndex{N,typeof(fdims),typeof(poscols),rowtype}(
+        fdims, poscols, Dict{Tuple{Vararg{Int}},Any}(), ReentrantLock())
     return core, perm
 end
 
-# Reorder a value column into the core's sorted row order. When the table was
-# already sorted (`perm === nothing`) no copy is made at all -- `convert` is a
-# no-op for a `Vector{T}` input -- so the result may ALIAS the table's own
+# Reorder a value column into the core's sorted row order, gathering (and
+# eltype-converting, if needed) in a single pass -- one allocation even when
+# `col` is not already a `Vector{T}`. When the table was already sorted
+# (`perm === nothing`) no copy is made at all -- `convert` is a no-op for a
+# `Vector{T}` input -- so the result may ALIAS the table's own
 # column. That sharing is deliberate: this package never mutates values, and it
 # saves a full copy per value column. The flip side is that a caller who
 # mutates the source table's column in place afterwards will see the array
 # change with it.
-_sortvals(::Type{T}, col, perm::Vector) where T = convert(Vector{T}, col)[perm]
+_sortvals(::Type{T}, col, perm::Vector) where T = T[col[p] for p in perm]
 _sortvals(::Type{T}, col, ::Nothing) where T = convert(Vector{T}, col)
 
-# the concrete (possibly heterogeneous, per-dimension-width) key type for the
-# index over dimension-subset `subset`, e.g. subset=(1,3) -> Tuple{UInt16,UInt8}
-_keytype(core::SparseDimIndex, subset::Tuple{Vararg{Int}}) =
-    Tuple{ntuple(j -> core.postypes[subset[j]], length(subset))...}
+# CSR-style index over one non-prefix dimension subset: every row id, grouped
+# by that subset's (narrow, possibly heterogeneous-width) key, in ONE
+# exact-length vector, plus key -> block range. Compared to the obvious
+# Dict{key,Vector{row}} this avoids a per-key Vector header and push!-growth
+# capacity slop -- which together more than doubled resident size for
+# many-key subsets -- and makes each group's rows contiguous.
+struct GroupIndex{KT,RT}
+    rows::Vector{RT}                # all row ids; ascending within each group
+    ranges::Dict{KT,UnitRange{RT}}  # key -> block in `rows`
+end
+Base.length(g::GroupIndex) = length(g.ranges)
+
+# Two passes over the subset's position columns (specialized on their concrete
+# types via the outer dynamic call): count rows per key, carve `rows` into one
+# exclusive block per key, then fill -- every group exactly sized, no push!.
+_groupindex(cols::Tuple{Vararg{Vector}}, ::Type{RT}) where RT =
+    _groupindex(Tuple{map(eltype, cols)...}, cols, RT)
+function _groupindex(::Type{KT}, cols::NTuple{K,Vector}, ::Type{RT}) where {KT,K,RT}
+    n = length(cols[1])
+    counts = Dict{KT,Int}()
+    for r in 1:n
+        key = map(c -> @inbounds(c[r]), cols)
+        counts[key] = get(counts, key, 0) + 1
+    end
+    ranges = Dict{KT,UnitRange{RT}}()
+    sizehint!(ranges, length(counts))
+    stop = 0
+    for (key, c) in counts
+        ranges[key] = RT(stop+1):RT(stop+c)
+        stop += c
+    end
+    for (key, rng) in ranges   # reuse `counts` as each key's next-write cursor
+        counts[key] = Int(first(rng))
+    end
+    rows = Vector{RT}(undef, n)
+    for r in 1:n
+        key = map(c -> @inbounds(c[r]), cols)
+        i = counts[key]
+        @inbounds rows[i] = RT(r)
+        counts[key] = i + 1
+    end
+    GroupIndex{KT,RT}(rows, ranges)
+end
+
+# rows matching `combo` in this index, as a contiguous view -- or `nothing`
+function _grouprows(g::GroupIndex{KT}, combo::Tuple) where KT
+    rng = get(g.ranges, convert(KT, combo), nothing)
+    rng === nothing ? nothing : view(g.rows, Int(first(rng)):Int(last(rng)))
+end
 
 # Is `subset` a leading run (1, 2, ..., k)? Those are served by the sort order.
 _isprefix(subset::Tuple{Vararg{Int}}) = subset === ntuple(identity, length(subset))
@@ -117,32 +174,24 @@ _isprefix(subset::Tuple{Vararg{Int}}) = subset === ntuple(identity, length(subse
 # Rows matching a prefix `combo`, as a contiguous range of (sorted) row indices:
 # narrow [lo:hi] one dimension at a time with binary search. Within each block
 # the next dimension's column is sorted (it's the primary key of that sub-block),
-# so `searchsorted` is valid.
-function _prefixrange(core::SparseDimIndex, subset::Tuple{Vararg{Int}}, combo::Tuple)
-    lo = 1; hi = length(core.poscols[1])
-    @inbounds for j in eachindex(subset)
-        col = core.poscols[subset[j]]
-        s = searchsorted(view(col, lo:hi), combo[j])
-        isempty(s) && return 1:0
-        hi = lo + last(s) - 1
-        lo = lo + first(s) - 1
-    end
-    return lo:hi
+# so `searchsorted` is valid. Recurse down the poscols tuple (rather than loop
+# with a runtime index) so each level's column is CONCRETELY typed -- a
+# union-typed column would heap-allocate its `view` on every lookup.
+_prefixrange(core::SparseDimIndex, combo::Tuple) =
+    _prefixwalk(core.poscols, combo, 1, length(core.poscols[1]))
+_prefixwalk(cols::Tuple, ::Tuple{}, lo::Int, hi::Int) = lo:hi
+function _prefixwalk(cols::Tuple, combo::Tuple, lo::Int, hi::Int)
+    s = searchsorted(view(cols[1], lo:hi), combo[1])
+    isempty(s) && return 1:0
+    _prefixwalk(Base.tail(cols), Base.tail(combo), lo + first(s) - 1, lo + last(s) - 1)
 end
 
-# lazily build + cache the hash index for a NON-prefix subset; row lists are in
+# lazily build + cache the group index for a NON-prefix subset; row ids are in
 # sorted row order (matching `poscols` and the layers' reordered values)
 function _getindex!(core::SparseDimIndex, subset::Tuple{Vararg{Int}})
     lock(core.lock) do
         get!(core.indices, subset) do
-            KT, RT = _keytype(core, subset), core.rowtype
-            k = length(subset)
-            idx = Dict{KT,Vector{RT}}()
-            for r in eachindex(core.poscols[1])
-                key = convert(KT, ntuple(j -> core.poscols[subset[j]][r], k))
-                push!(get!(() -> RT[], idx, key), RT(r))
-            end
-            idx
+            _groupindex(map(i -> core.poscols[i], subset), _rowtype(core))
         end
     end
 end
@@ -162,7 +211,7 @@ Base.size(A::SparseArray) = map(length, A.core.dims)
 
 # scalar fast path: the full key is a prefix -> binary search to the single row
 function Base.getindex(A::SparseArray{T,N}, I::Vararg{Int,N}) where {T,N}
-    rng = _prefixrange(A.core, ntuple(identity, N), I)
+    rng = _prefixrange(A.core, I)
     isempty(rng) ? A.missingval : A.values[first(rng)]
 end
 
@@ -173,6 +222,27 @@ _aslist(i::AbstractUnitRange{<:Integer}, n) = i
 _isfull(i, n) = i isa Base.Slice || (i isa AbstractUnitRange && first(i) == 1 && last(i) == n)
 
 const _StdIdx = Union{Integer,AbstractVector{<:Integer},Colon}
+
+# The full-materialize and per-combo row-write loops, behind function barriers
+# so they specialize on the concrete narrow poscols types: one dynamic call per
+# query (or per key-combo) instead of boxing on every row.
+function _fillall!(out::Array{T,N}, values::Vector{T}, poscols::NTuple{N,Vector}) where {T,N}
+    @inbounds for r in eachindex(values)
+        out[ntuple(d -> Int(poscols[d][r]), Val(N))...] = values[r]
+    end
+end
+# `dimrole[d]` is the output index source for dimension d: `nothing` -> the
+# row's own position, an integer -> that slot of the (per-combo) `restr_out`.
+# `map` over the tuples (not `ntuple` over 1:N) so each element call sees the
+# CONCRETE column/role types -- runtime tuple indexing here boxes every access.
+function _writerows!(out::Array{T,N}, values::Vector{T}, poscols::NTuple{N,Vector},
+                      rows, dimrole::NTuple{N,Union{Nothing,Int}}, restr_out) where {T,N}
+    @inbounds for r in rows
+        outidx = map((c, role) -> role === nothing ? Int(c[r]) : Int(restr_out[role]),
+                     poscols, dimrole)
+        out[outidx...] = values[r]
+    end
+end
 
 # every other index combination: builds a dense Array (with the same
 # axis-dropping convention as ordinary Array indexing -- an Integer index drops
@@ -191,24 +261,16 @@ function Base.getindex(A::SparseArray{T,N}, I::Vararg{_StdIdx,N}) where {T,N}
 
     if isempty(restricted)
         # nothing restricted: full materialize, one pass over every row
-        for r in eachindex(A.values)
-            outidx = ntuple(d -> Int(core.poscols[d][r]), N)
-            out[outidx...] = A.values[r]
-        end
+        _fillall!(out, A.values, core.poscols)
     else
         selmap = ntuple(d -> full[d] ? nothing : Dict(v => i for (i, v) in enumerate(lists[d])), N)
-        KT = _keytype(core, restricted)
         prefix = _isprefix(restricted)
-        idx = prefix ? nothing : _getindex!(core, restricted)   # searchsorted vs hash
+        idx = prefix ? nothing : _getindex!(core, restricted)   # searchsorted vs group index
         for combo in Iterators.product(ntuple(j -> lists[restricted[j]], length(restricted))...)
-            ckey = convert(KT, combo)
-            rows = prefix ? _prefixrange(core, restricted, ckey) : get(idx, ckey, nothing)
+            rows = prefix ? _prefixrange(core, combo) : _grouprows(idx, combo)
             (rows === nothing || isempty(rows)) && continue
             restr_out = ntuple(j -> selmap[restricted[j]][combo[j]], length(restricted))
-            for r in rows
-                outidx = ntuple(d -> dimrole[d] === nothing ? Int(core.poscols[d][r]) : restr_out[dimrole[d]], N)
-                out[outidx...] = A.values[r]
-            end
+            _writerows!(out, A.values, core.poscols, rows, dimrole, restr_out)
         end
     end
 
@@ -234,12 +296,14 @@ Rows are sorted once (at construction) by their per-dimension positions, so a
 query that fixes a *prefix* of the dimensions -- `dim1`, `(dim1,dim2)`, ..., or
 the full key (a scalar lookup) -- is answered by binary search over a
 contiguous block, at no extra storage. A query that fixes a non-prefix subset
-(e.g. `dim2` alone, or `(dim1,dim3)`) uses a hash index built once, lazily, on
+(e.g. `dim2` alone, or `(dim1,dim3)`) uses a group index built once, lazily, on
 first use and cached -- or upfront via the `indices` keyword.
 
-Every hash index packs its keys and row lists into the *narrowest* unsigned
-integer type that fits (`UInt8`/`UInt16`/`UInt32`/`UInt64`, per dimension from
-its length, and once overall for row positions from `length(table)`).
+Every group index stores all row ids, grouped by key, in one exact-length
+vector plus a key -> block-range table (no per-key vectors to over-allocate),
+packed into the *narrowest* unsigned integer type that fits
+(`UInt8`/`UInt16`/`UInt32`/`UInt64`, per dimension from its length, and once
+overall for row ids from `length(table)`).
 
 Only the key columns and the requested value column(s) are ever read from
 `table`, so lazy columnar sources (e.g. a Parquet2 `Dataset`) never decode
